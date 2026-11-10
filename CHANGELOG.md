@@ -13,6 +13,7 @@ aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **exec.token**：0.2.x 中是 symbol（`ToolExecutionToken`），preimage 的 Map key 改为直接使用 token 对象，不再要求 string；token 缺失时回退文件路径。
 - **Word 工具条件注册**：8 个 `writing_word_*` 改为 `ctx.tools.register(def, { when })`，默认只在论文工作区可见（cwd 命中论文特征路径，或工作区 2 层内存在 `.docx`），避免 13 个工具全部常驻；`config.wordTools: 'auto' | 'always' | 'off'` 可切换。5 个文本工具始终常驻。
 - **修复上游打包 bug**：`word_guard` Python 模块在发布包里位于 `<root>/src/word_guard/`，而代码固定取 `<lib>/word_guard/cli.py`，导致 8 个 Word 工具装好后必然 ENOENT。改为按优先级探测（`src` → `lib` → `~/.dsh/plugins` 副本），并统一 `DSH_PYTHON` / `python` / `python3` 解释器候选；缺 python-docx 时给出可执行提示而不是裸报错。
+- **postinstall 修复**：`scripts/install-extras.mjs` 不再使用 `fs.cpSync`（Windows + Node 24 + 中文路径下会以 `0xC0000409` 硬崩，导致 postinstall 失败），改为 `mkdirSync` + `copyFileSync` 的显式遍历。
 
 ### Changed
 

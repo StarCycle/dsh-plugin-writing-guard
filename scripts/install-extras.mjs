@@ -7,7 +7,7 @@
  * does not fail. The plugin works without the skill/Python files; they just
  * enable natural-language triggering and Word editing.
  */
-import { existsSync, mkdirSync, cpSync, chmodSync } from 'node:fs'
+import { existsSync, mkdirSync, copyFileSync, readdirSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -23,10 +23,24 @@ function getDshHome() {
   return join(home, '.dsh')
 }
 
+/**
+ * 递归复制目录。
+ * v2.1：不用 fs.cpSync —— 在 Windows + Node 24 + 中文路径的工作区里它会以
+ * 0xC0000409（STATUS_STACK_BUFFER_OVERRUN）硬崩，postinstall 直接失败；
+ * 改为 mkdirSync + copyFileSync 的显式遍历。
+ */
 function copyDir(src, dest) {
   if (!existsSync(src)) return false
-  mkdirSync(dest, { recursive: true })
-  cpSync(src, dest, { recursive: true })
+  const walk = (from, to) => {
+    mkdirSync(to, { recursive: true })
+    for (const entry of readdirSync(from, { withFileTypes: true })) {
+      const source = join(from, entry.name)
+      const target = join(to, entry.name)
+      if (entry.isDirectory()) walk(source, target)
+      else if (entry.isFile()) copyFileSync(source, target)
+    }
+  }
+  walk(src, dest)
   return true
 }
 
