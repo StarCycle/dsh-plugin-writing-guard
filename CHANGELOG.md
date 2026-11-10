@@ -4,6 +4,21 @@ All notable changes to dsh-plugin-writing-guard are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-11-10
+
+### 适配 DeepSeek Harness 0.2.2-rc.1（fork 版本）
+
+- **安装门槛**：`peerDependencies` 从 `@deepseek-ai/dsh-tools|dsh-llm ^0.1.0-rc.6` 提升到 `^0.2.2-rc.1`（cordis 提到 `^4.1.0`）。0.1.x 的 peer 区间在 0.2.x 运行时会被 plugin_manager 的 `evaluatePluginCompatibility` 判为 IncompatiblePlugin，安装直接被拒。
+- **消息来源**：dsh 0.2.x 的 `MessageSourceMap` 改为 merge-extensible，已没有 catch-all 的 `plugin` kind。自动审计/速查注入改用本插件自定义的 `writing-guard` kind + `form: 'notice'` + `summary`（通过 `declare module '@deepseek-ai/dsh-llm'` 增强）。
+- **exec.token**：0.2.x 中是 symbol（`ToolExecutionToken`），preimage 的 Map key 改为直接使用 token 对象，不再要求 string；token 缺失时回退文件路径。
+- **Word 工具条件注册**：8 个 `writing_word_*` 改为 `ctx.tools.register(def, { when })`，默认只在论文工作区可见（cwd 命中论文特征路径，或工作区 2 层内存在 `.docx`），避免 13 个工具全部常驻；`config.wordTools: 'auto' | 'always' | 'off'` 可切换。5 个文本工具始终常驻。
+- **修复上游打包 bug**：`word_guard` Python 模块在发布包里位于 `<root>/src/word_guard/`，而代码固定取 `<lib>/word_guard/cli.py`，导致 8 个 Word 工具装好后必然 ENOENT。改为按优先级探测（`src` → `lib` → `~/.dsh/plugins` 副本），并统一 `DSH_PYTHON` / `python` / `python3` 解释器候选；缺 python-docx 时给出可执行提示而不是裸报错。
+
+### Changed
+
+- `PLUGIN_VERSION` 2.0.2 → 2.1.0；journal profile 测试改为引用 `PLUGIN_VERSION`，不再硬编码版本号。
+- 全部 390 项测试通过。
+
 ## [2.0.2] - 2026-10-05
 
 ### Changed — Word Guard 同步至 word-guard v1.1.0

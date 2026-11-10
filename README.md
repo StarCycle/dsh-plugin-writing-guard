@@ -21,6 +21,11 @@ It protects your manuscript across five layers:
 
 **Prompt-guided writing · Deterministic integrity core · 394 Tests**
 
+> **Fork note (v2.1.0)** — 本仓库是 [xmutfyh/dsh-plugin-writing-guard](https://github.com/xmutfyh/dsh-plugin-writing-guard) 的 fork，适配 **DeepSeek Harness 0.2.2-rc.1**：
+> peer 依赖对齐 0.2.x、改用 0.2.x 的自定义消息来源（`writing-guard` kind）、修复 Word 层 Python 模块路径，
+> 并把 8 个 `writing_word_*` 工具改为**按工作区条件注册**（`config.wordTools`），5 个文本工具始终常驻。
+> 安装：`dsh plugin add <本仓库绝对路径>`；Word 工具另需 `pip install python-docx`。
+
 ```
 npm install dsh-plugin-writing-guard
 ```

@@ -1,5 +1,5 @@
 import type { Context } from '@deepseek-ai/cordis'
-import { defineTool } from '@deepseek-ai/dsh-tools'
+import { defineTool, type ToolDefinition, type ToolRegistrationOptions } from '@deepseek-ai/dsh-tools'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import {
   auditText,
@@ -29,15 +29,93 @@ import {
   type DeliveryAuditOptions,
 } from './delivery.ts'
 import fs from 'node:fs/promises'
+import { existsSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+
+// v2.1（dsh 0.2.2 适配）：dsh 0.2.x 的 MessageSourceMap 改为 merge-extensible，
+// 每个 producer 在自己的模块里声明 kind，不再有 catch-all 的 `plugin` kind。
+// 这里给本插件声明自己的控制上下文来源（form: 'notice' + summary 是 0.2.x 的通知形态）。
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'writing-guard': {
+      readonly kind: 'writing-guard'
+      readonly form: 'notice'
+      readonly summary: string
+    }
+  }
+}
 
 export const name = 'dsh-plugin-writing-guard'
 
 export const inject = ['tools']
 
-/** 插件目录（用于定位 word_guard Python 模块） */
+/** 插件 lib 目录（编译产物所在目录） */
 const PLUGIN_DIR = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1'))
+/** 包根目录（lib 的上一级）：源码分发时 Python 在 <root>/src/word_guard */
+const PLUGIN_ROOT = path.resolve(PLUGIN_DIR, '..')
+
+/**
+ * Python word_guard CLI 的位置。
+ * 上游 2.0.x 固定取 <lib>/word_guard/cli.py，但发布的包里 Python 代码在 <root>/src/word_guard/，
+ * 导致 8 个 Word 工具装好后必然 ENOENT。v2.1 按优先级探测：源码树 → lib 副本 → postinstall 副本。
+ */
+const WORD_GUARD_CLI_CANDIDATES = [
+  path.join(PLUGIN_ROOT, 'src', 'word_guard', 'cli.py'),
+  path.join(PLUGIN_ROOT, 'lib', 'word_guard', 'cli.py'),
+  path.join(PLUGIN_DIR, 'word_guard', 'cli.py'),
+  path.join(os.homedir(), '.dsh', 'plugins', 'dsh-plugin-writing-guard', 'word_guard', 'cli.py'),
+]
+
+function resolveWordGuardCli(): string {
+  for (const candidate of WORD_GUARD_CLI_CANDIDATES) {
+    try {
+      if (existsSync(candidate)) return candidate
+    } catch {
+      // 不可读目录：继续下一个候选
+    }
+  }
+  return WORD_GUARD_CLI_CANDIDATES[0]
+}
+
+/** Python 解释器候选：DSH_PYTHON > 平台默认（Windows 常只有 python，Linux/macOS 常只有 python3） */
+function pythonCandidates(): string[] {
+  if (process.env.DSH_PYTHON) return [process.env.DSH_PYTHON]
+  return process.platform === 'win32' ? ['python', 'python3'] : ['python3', 'python']
+}
+
+/** 运行一次 word_guard 子命令；缺解释器/缺模块时给可执行提示，而不是裸 ENOENT */
+async function runWordGuardCommand(command: string, extraArgs: string[]): Promise<string> {
+  const { execFile } = await import('node:child_process')
+  const cli = resolveWordGuardCli()
+  if (!existsSync(cli)) {
+    throw new Error(
+      `word_guard Python 模块未找到（期望 ${cli}）。请在插件目录运行 node scripts/install-extras.mjs，或确认 src/word_guard/cli.py 存在。`,
+    )
+  }
+  const args = [cli, command, ...extraArgs]
+  const candidates = pythonCandidates()
+  let lastError: unknown
+  for (const pythonCmd of candidates) {
+    try {
+      return await new Promise<string>((resolve, reject) => {
+        execFile(pythonCmd, args, { maxBuffer: 10 * 1024 * 1024, timeout: 60_000 }, (err, stdout, stderr) => {
+          if (err) reject(new Error(`word_guard ${command} 失败：${err.message}\n${stderr}`))
+          else resolve(stdout)
+        })
+      })
+    } catch (error) {
+      lastError = error
+    }
+  }
+  const detail = lastError instanceof Error ? lastError.message : String(lastError)
+  throw new Error(
+    `无法运行 word_guard（已尝试 ${candidates.join(', ')}）。Word 工具需要 Python 3.10+ 与 python-docx：\n` +
+      '  pip install python-docx\n' +
+      '  或设置环境变量 DSH_PYTHON 指向解释器。\n' +
+      `最后一次错误：${detail}`,
+  )
+}
 
 export type Mode = 'conservative' | 'balanced' | 'strict'
 
@@ -69,6 +147,12 @@ export interface Config {
   mode?: Mode
   /** v0.5：增量审计状态文件（缺省 ~/.dsh/plugins/dsh-plugin-writing-guard/state.json） */
   stateFile?: string
+  /**
+   * v2.1：8 个 Word 工具（writing_word_*）的可见性，用来控制常驻上下文成本。
+   * auto（默认）= 只在论文/稿件工作区注册（cwd 命中论文特征路径，或工作区 2 层内存在 .docx）；
+   * always = 所有会话常驻；off = 不注册。5 个文本工具始终常驻。
+   */
+  wordTools?: 'auto' | 'always' | 'off'
 }
 
 /**
@@ -85,6 +169,7 @@ const DEFAULT_CONFIG: Config = {
   autoAuditMinSeverity: 'high',
   maxAutoInjectPerTurn: 2,
   projectResidueTerms: [],
+  wordTools: 'auto',
 }
 
 /** 默认项目内部词表（通用痕迹，不含 priority/SHA-256 等普通学术词） */
@@ -251,16 +336,8 @@ async function readTextFile(filePath: string): Promise<string> {
   if (ext === '.docx' || ext === '.doc') {
     // v1.8：通过 Python word_guard 提取 DOCX 文本（无需 anydoc 中转）
     try {
-      const { execFile } = await import('node:child_process')
-      const pythonCmd = process.env.DSH_PYTHON ?? 'python3'
-      const wordGuardCli = path.join(PLUGIN_DIR, 'word_guard', 'cli.py')
-      const args = [wordGuardCli, 'audit', filePath]
-      return await new Promise<string>((resolve, reject) => {
-        execFile(pythonCmd, args, { maxBuffer: 10 * 1024 * 1024, timeout: 30_000 }, (err, stdout) => {
-          if (err) reject(new Error(`DOCX text extraction failed: ${err.message}`))
-          else resolve(stdout)
-        })
-      })
+      // v2.1：路径与解释器统一交给 runWordGuardCommand 探测（源码树 / 安装副本 / python / python3）
+      return await runWordGuardCommand('audit', [filePath])
     } catch (e) {
       throw new Error(`"${filePath}" 是 DOCX 文档，文本提取失败: ${e instanceof Error ? e.message : String(e)}。请先调用 anydoc 工具转换为 Markdown。`)
     }
@@ -336,7 +413,7 @@ export function apply(ctx: Context, config: Partial<Config> = {}): void {
   const stateLoaded = loadState(stateFile).catch(() => emptyState())
   // v0.9：preimage 按 exec.token 键控（同一文件并发 edit 不串扰；分析建议），
   // 内部保留 path 校验；token 缺失时回退到文件路径键。优先级高于持久化基线缓存。
-  const preimages = new Map<string, { path: string; content: string; ts: number }>()
+  const preimages = new Map<unknown, { path: string; content: string; ts: number }>()
 
   ctx.tools.register(defineTool({
     name: 'writing_audit',
@@ -643,40 +720,84 @@ export function apply(ctx: Context, config: Partial<Config> = {}): void {
     },
   }))
 
-  // ---------- Word 文档安全编辑工具（v1.8） ----------
+  // ---------- Word 文档安全编辑工具（v1.8 / v2.1 条件注册） ----------
 
-  /** Python word_guard 模块路径 */
-  const WORD_GUARD_PATH = path.join(PLUGIN_DIR, 'word_guard', 'cli.py')
+  /**
+   * v2.1：8 个 Word 工具的描述合计约 3 千字符，常驻时每次请求都要为它们付 token。
+   * 默认只在"看起来像论文工作区"的会话里注册：cwd 命中论文特征路径，或工作区根目录有 .docx。
+   * 判定结果按 cwd 缓存 15 秒，避免每个 step 都读目录。
+   */
+  const paperWorkspaceCache = new Map<string, { at: number; ok: boolean }>()
 
-  /** 调用 Python word_guard 模块的辅助函数 */
-  async function callWordGuard(command: string, ...extraArgs: string[]): Promise<string> {
-    const { execFile } = await import('node:child_process')
-    // 优先级：DSH_PYTHON > python3 > python（Windows 常只有 python）
-    const candidates = process.env.DSH_PYTHON
-      ? [process.env.DSH_PYTHON]
-      : process.platform === 'win32'
-        ? ['python', 'python3']
-        : ['python3', 'python']
-    const args = [WORD_GUARD_PATH, command, ...extraArgs]
-    // Try each candidate until one works
-    for (const pythonCmd of candidates) {
+  /** 在工作区里找 .docx：最多下探 2 层（覆盖 papers/ 之类子目录），跳过依赖/隐藏目录，带条目预算 */
+  function findDocxInWorkspace(cwd: string): boolean {
+    const skip = new Set(['node_modules', '.git', '.dsh', 'dist', 'build', '__pycache__', 'venv', '.venv'])
+    let budget = 1500
+    const stack: Array<{ dir: string; depth: number }> = [{ dir: cwd, depth: 0 }]
+    while (stack.length > 0 && budget > 0) {
+      const current = stack.pop()
+      if (!current) break
+      let entries
       try {
-        const result = await new Promise<string>((resolve, reject) => {
-          execFile(pythonCmd, args, { maxBuffer: 10 * 1024 * 1024, timeout: 60_000 }, (err, stdout, stderr) => {
-            if (err) reject(new Error(`word_guard ${command} failed: ${err.message}\n${stderr}`))
-            else resolve(stdout)
-          })
-        })
-        return result
-      } catch (e) {
-        if (pythonCmd === candidates[candidates.length - 1]) throw e
-        // Try next candidate
+        entries = readdirSync(current.dir, { withFileTypes: true })
+      } catch {
+        continue
+      }
+      for (const entry of entries) {
+        budget -= 1
+        if (budget <= 0) break
+        if (entry.isFile()) {
+          if (/\.docx?$/i.test(entry.name)) return true
+          continue
+        }
+        if (entry.isDirectory() && current.depth < 2 && !skip.has(entry.name) && !entry.name.startsWith('.')) {
+          stack.push({ dir: path.join(current.dir, entry.name), depth: current.depth + 1 })
+        }
       }
     }
-    throw new Error('No Python interpreter found')
+    return false
   }
 
-  ctx.tools.register(defineTool({
+  function looksLikePaperWorkspace(cwd: string | undefined): boolean {
+    if (!cwd) return false
+    if (isPaperPath(cwd)) return true
+    const cached = paperWorkspaceCache.get(cwd)
+    const now = Date.now()
+    if (cached && now - cached.at < 15_000) return cached.ok
+    let ok = false
+    try {
+      ok = findDocxInWorkspace(cwd)
+    } catch {
+      ok = false
+    }
+    paperWorkspaceCache.set(cwd, { at: now, ok })
+    return ok
+  }
+
+  const wordToolsMode = cfg.wordTools ?? 'auto'
+  const wordToolOptions: ToolRegistrationOptions = {
+    when: (activation) => {
+      if (wordToolsMode === 'always') return true
+      if (wordToolsMode === 'off') return false
+      try {
+        const agent = activation.agent as unknown as { session?: { header?: { cwd?: string } } }
+        return looksLikePaperWorkspace(agent.session?.header?.cwd)
+      } catch {
+        return true
+      }
+    },
+  }
+
+  /** 注册一个 Word 工具：按工作区条件激活（auto 模式） */
+  const registerWordTool = (definition: ToolDefinition): (() => void) =>
+    ctx.tools.register(definition, wordToolOptions)
+
+  /** 调用 Python word_guard 模块的辅助函数（路径/解释器探测在 runWordGuardCommand 里） */
+  async function callWordGuard(command: string, ...extraArgs: string[]): Promise<string> {
+    return await runWordGuardCommand(command, extraArgs)
+  }
+
+  registerWordTool(defineTool({
     name: 'writing_word_scan',
     description:
       'DOCX 结构化扫描（dsh-plugin-writing-guard v' + PLUGIN_VERSION + '）：对 Word 文档执行结构化扫描，返回文档 profile、标题层级、段落信息、表格、复杂对象检测。' +
@@ -698,7 +819,7 @@ export function apply(ctx: Context, config: Partial<Config> = {}): void {
     },
   }))
 
-  ctx.tools.register(defineTool({
+  registerWordTool(defineTool({
     name: 'writing_word_edit',
     description:
       'Word 文档安全编辑（dsh-plugin-writing-guard v' + PLUGIN_VERSION + '）：对 .docx 文件执行局部安全编辑。' +
@@ -774,7 +895,7 @@ export function apply(ctx: Context, config: Partial<Config> = {}): void {
     },
   }))
 
-  ctx.tools.register(defineTool({
+  registerWordTool(defineTool({
     name: 'writing_word_audit',
     description:
       'Word 文档写作审计（dsh-plugin-writing-guard v' + PLUGIN_VERSION + '）：对 .docx 文件执行写作纪律检查。' +
@@ -796,7 +917,7 @@ export function apply(ctx: Context, config: Partial<Config> = {}): void {
     },
   }))
 
-  ctx.tools.register(defineTool({
+  registerWordTool(defineTool({
     name: 'writing_word_scope_check',
     description:
       'Word 文档范围完整性检查（dsh-plugin-writing-guard v' + PLUGIN_VERSION + '）：验证编辑操作是否修改了请求范围之外的内容。' +
@@ -829,7 +950,7 @@ export function apply(ctx: Context, config: Partial<Config> = {}): void {
     },
   }))
 
-  ctx.tools.register(defineTool({
+  registerWordTool(defineTool({
     name: 'writing_word_format_tables',
     description:
       'Word 文档三线表格式化（dsh-plugin-writing-guard v' + PLUGIN_VERSION + '）：将 .docx 中所有表格转换为学术三线表格式。' +
@@ -854,7 +975,7 @@ export function apply(ctx: Context, config: Partial<Config> = {}): void {
     },
   }))
 
-  ctx.tools.register(defineTool({
+  registerWordTool(defineTool({
     name: 'writing_word_audit_equations',
     description:
       'Word 文档公式审计（dsh-plugin-writing-guard v' + PLUGIN_VERSION + '）：对 .docx 中的原生 OMML 公式进行只读审计。' +
@@ -878,7 +999,7 @@ export function apply(ctx: Context, config: Partial<Config> = {}): void {
     },
   }))
 
-  ctx.tools.register(defineTool({
+  registerWordTool(defineTool({
     name: 'writing_word_package_validate',
     description:
       'DOCX OOXML 包完整性检查（dsh-plugin-writing-guard v' + PLUGIN_VERSION + '）：解析全部 XML/relationships，' +
@@ -899,7 +1020,7 @@ export function apply(ctx: Context, config: Partial<Config> = {}): void {
     },
   }))
 
-  ctx.tools.register(defineTool({
+  registerWordTool(defineTool({
     name: 'writing_word_fingerprint',
     description:
       '生成 DOCX 基准格式指纹（dsh-plugin-writing-guard v' + PLUGIN_VERSION + '）：记录 styles/settings/numbering 哈希、' +
@@ -949,9 +1070,9 @@ export function apply(ctx: Context, config: Partial<Config> = {}): void {
         const agent = exec as { agent?: { id?: string; session?: { header?: { cwd?: string } } } }
         if (!agent.agent || typeof agent.agent.id !== 'string') return next()
         if (!isPaperFile(target, agent.agent.session?.header?.cwd)) return next()
-        // v0.9：exec.token 作为 key（DSH 官方 execution state 范式），path 存进条目用于校验
-        const token = (exec as { token?: unknown }).token
-        const key = typeof token === 'string' && token ? token : target
+        // v2.1：dsh 0.2.x 的 exec.token 是 symbol（ToolExecutionToken），直接用对象身份做 key，
+        // 不再要求 string；token 缺失时回退到文件路径。path 仍存进条目用于校验。
+        const key: unknown = (exec as { token?: unknown }).token ?? target
         preimages.set(key, { path: target, content: await fs.readFile(target, 'utf8'), ts: Date.now() })
       } catch {
         // 新文件或不可读：无 preimage（首次写入无基线；后续写入由基线缓存兜底）
@@ -977,8 +1098,7 @@ export function apply(ctx: Context, config: Partial<Config> = {}): void {
           const afterContent = await readTextFile(target)
           // v0.9 自动 Scholarship/Epistemic Lock：preimage（exec.token 键控）优先，否则用基线缓存；
           // preimage 条目需与本次目标文件同路径（token 复用/路径变化时不误配 before/after）
-          const token = (exec as { token?: unknown }).token
-          const key = typeof token === 'string' && token ? token : target
+          const key: unknown = (exec as { token?: unknown }).token ?? target
           const pre = preimages.get(key)
           preimages.delete(key)
           const original = pre && pre.path === target ? pre.content : (await stateLoaded).baselines.get(target)?.content
@@ -1030,7 +1150,7 @@ export function apply(ctx: Context, config: Partial<Config> = {}): void {
           if (diff.remaining === 0) {
             const notice = createUserMessage({
               content: [{ type: 'text', text: `【dsh-plugin-writing-guard】"${target}" 写作纪律问题已全部清零 ✅` }],
-              source: { kind: 'plugin', plugin: name },
+              source: { kind: 'writing-guard', form: 'notice', summary: `写作纪律清零：${path.basename(target)}` },
             })
             return { ...decision, additionalContexts: [...(decision.additionalContexts ?? []), notice] }
           }
@@ -1048,7 +1168,7 @@ export function apply(ctx: Context, config: Partial<Config> = {}): void {
 
         const notice = createUserMessage({
           content: [{ type: 'text', text }],
-          source: { kind: 'plugin', plugin: name },
+          source: { kind: 'writing-guard', form: 'notice', summary: `写作纪律：新增 ${diff.added.length} 项` },
         })
 
         // 把自动审计结果作为下一条请求的附加上下文（不阻塞本次调用）
@@ -1084,7 +1204,7 @@ export function apply(ctx: Context, config: Partial<Config> = {}): void {
         briefCounts.set(agent.id, { turn })
         ;(agent as { inject?: (msg: unknown) => void }).inject?.(createUserMessage({
           content: [{ type: 'text', text: rulesBrief() }],
-          source: { kind: 'plugin', plugin: name },
+          source: { kind: 'writing-guard', form: 'notice', summary: '写作纪律速查' },
         }))
       } catch (error) {
         ctx.logger.warn(`dsh-plugin-writing-guard: autoBrief failed: ${error instanceof Error ? error.message : String(error)}`)
